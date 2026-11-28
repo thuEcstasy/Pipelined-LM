@@ -11,3 +11,5 @@ wandb/
 .env
 *.pt
 *.safetensors
+runs/
+.ruff_cache/

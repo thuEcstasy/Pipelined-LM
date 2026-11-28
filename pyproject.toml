@@ -5,10 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pipelined-lm"
 version = "0.1.0"
-description = "Untied four-stage pipelined language models with cross-trajectory state and KV access"
+description = "Shared-weight PLT and untied pipelined language models with training and streaming decode"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["torch>=2.11,<2.12"]
 
 [tool.setuptools.packages.find]
 include = ["pipelined_lm*"]
+
+[project.optional-dependencies]
+data = ["huggingface-hub>=0.30,<2", "tokenizers>=0.21,<0.24", "numpy>=1.26", "pyarrow>=16"]

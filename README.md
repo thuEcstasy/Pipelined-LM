@@ -1,97 +1,88 @@
-# Pipelined LM
+# PLT and Pipelined LM
 
-Pipelined LM is an autoregressive Transformer that overlaps the work for successive predictions. Each prediction travels through four independently parameterized stages. While the last stage finishes one prediction, the other three advance newer trajectories. After the pipeline fills, one execution cycle emits one token.
+Train autoregressive models that overlap work for successive predictions. All three recipes support sequence-parallel training, prefill, incremental decode, held-out validation, and resumable single-device or distributed pretraining.
 
-The research model uses a Qwen3-0.6B-shaped backbone with **2 input layers, 4 stages of 6 layers, and 2 output layers**. A trajectory traverses all 28 layers. The ideal per-cycle critical path is 10 layer evaluations when the four middle stages execute concurrently. Actual decode latency depends on attention, memory traffic and the execution backend.
+| Recipe | One prediction trajectory | Attention and hidden-state inputs |
+|---|---|---|
+| `plt4` | Four passes through one shared 28-layer stack | The first pass supplies global KV; each later pass reads its own 64-cycle window. Each pass takes the current embedding and its own trajectory's previous pass output. |
+| `folded-plt4` | Each of the four shared passes splits into four 7-layer stages, for 16 stages total | Direct 2D G-SWA with 7 global banks and 105 windows of 32 cycles. Earlier stages publish the legal same-cycle frontier. Every stage receives the current embedding. Foresight is off. |
+| `pipeline` | 2 input layers, four independent 6-layer stages, 2 output layers | Foresight at each stage boundary, direct 2D G-SWA with a shared first-stage global bank per layer offset and 64-cycle local windows. |
 
-## Follow one prediction
+[Architecture, other cache policies, and previous experimental results](docs/architecture.md)
 
-| Cycle | Stage 1 | Stage 2 | Stage 3 | Stage 4 |
-|---|---|---|---|---|
-| 1 | **A1** | | | |
-| 2 | B1 | **A2** | | |
-| 3 | C1 | B2 | **A3** | |
-| 4 | D1 | C2 | B3 | **A4** |
+## Start here from a clean checkout
 
-The path for prediction **A** is **A1 → A2 → A3 → A4**. Each stage receives the representation of the token observed in its current cycle. A4 therefore has access to a token that A1 had yet to observe. The table shows the trajectories starting at cycle 1; real prefill also computes boundary states for earlier positions.
-
-**Foresight** lets A4 read the completed states A3, B2 and C1 from cycle 3. A3 carries its main trajectory; B2 and C1 bring intermediate computations from neighboring trajectories. With `foresight=False`, only A3 is used at that boundary.
-
-**Frontier KV** works inside attention. A4 can retrieve keys and values at the same layer offset from earlier stages, including newly published projections for B3, C2 and D1 where the policy permits. These are latent predictions computed from the observed prefix. Training processes a stage across the sequence in parallel. Decode publishes the current same-offset K/V projections before the stages perform attention.
-
-## Quickstart
-
-Python 3.10+ and PyTorch 2.11.x. The default example uses a small CPU model with exactly the same four-stage schedule.
+Use Linux, Python 3.10 or newer and PyTorch 2.11.x. The CPU path works without any model downloads. For GPU training, install a CUDA-enabled PyTorch 2.11.x build compatible with the host and use an allocated BF16-capable GPU. Run from the repository root. Access to this repository is required to clone it.
 
 ```bash
 git clone https://github.com/thuEcstasy/Pipelined-LM.git
 cd Pipelined-LM
-python -m pip install -e .
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e '.[data]'
 python -m unittest discover -s tests -v
-python examples/train.py --steps 3 --output checkpoints/tiny.pt
-python examples/decode.py checkpoints/tiny.pt --tokens 1 2 3 --new-tokens 4
 ```
 
-The example trains on synthetic token IDs and prints generated IDs. To train on your own data, pass `--data rows.pt`, a `torch.save`d int64 tensor of shape `[rows, tokens_per_row]`. Each row is an independent sequence. Use `--size qwen06` for the research width and vocabulary, and `--device cuda` for BF16 training. The example is a single-device training loop.
+**Instruction to give a Codex agent**
 
-```python
-import torch
-from pipelined_lm import PipelinedLM, tiny_backbone
+> Follow this README in a clean checkout. Install the package and run the correctness tests. Run all three CPU smoke recipes below, resume one checkpoint, and decode from it. Report the last step, target count and validation NLL for each run. If I specify a corpus, GPU allocation and budget, proceed to the corresponding real-data recipe after the backend check passes.
 
-model = PipelinedLM(tiny_backbone(), policy="direct").eval()
-ids = torch.tensor([[11, 23, 7, 19]])
-with torch.inference_mode():
-    whole = model(ids)
-    prefix = model.prefill(ids[:, :3])
-    last = model.decode(ids[:, 3:], cache=prefix.cache)
-    torch.testing.assert_close(last.logits, whole[:, -1:], atol=2e-5, rtol=1e-4)
+```bash
+for recipe in plt4 folded-plt4 pipeline; do
+  python -m pipelined_lm.train --smoke --recipe "$recipe" --steps 2 --output "runs/smoke/$recipe" || exit 1
+done
+python -m pipelined_lm.train --smoke --recipe folded-plt4 --steps 3 --resume --output runs/smoke/folded-plt4
+python examples/decode.py runs/smoke/folded-plt4/latest.pt --tokens 11 23 7 --new-tokens 4
 ```
 
-For packed documents, pass matching `docs` and boolean `valid` tensors to the model or to `model.loss(ids, docs, valid=valid)`. The loss excludes padding and cross-document targets.
+The smoke run uses generated IDs. With default settings each update scores 64 next-token targets. Look for JSON events named `ready`, `train`, `validation`, and `checkpoint`. At step 2, each job should have 128 cumulative training targets and a `latest.pt`. The resumed folded run should reach 192.
 
-## Choosing a cache policy
+## First real-data run
 
-All six policies use the same untied pipeline. In 2D attention, a receiver at stage *r* and prediction position *t* can read a producer at stage *j ≤ r* at the same within-stage layer offset. History ends at *s ≤ t*. The additional legal frontier is *t < s ≤ t + r − j*.
+The following commands fetch the pinned Qwen tokenizer and stream public FineWeb-Edu and FineMath-3+ text. They write fixed-width rows with 90% web and 10% math over every ten rows. Validation documents are assigned by a deterministic hash before tokenization. The first preparation requires network access. To use the original web-only PLT-4 corpus family, change `--corpus mix` to `--corpus web` and select a different output directory.
 
-| `policy` | Sources available to a middle-stage query | KV capacity |
-|---|---|---|
-| `full_1d` | The receiver’s own full causal history | 28 full banks |
-| `full_2d` | Its own and earlier stages’ full histories through the legal frontier | 28 full banks |
-| `gswa_1d` | Stage 1 global through the current cycle, mixed with the receiver’s own window | 10 full + 18 windows |
-| `history` | Stage 1 global and local windows from stages 2 through *r*, restricted to history | 10 full + 18 windows |
-| `direct` (default) | The same global/local banks, with frontier indices included directly | 10 full + 18 windows |
-| `gated` | The history base plus separate attention over frontier entries, with a learned per-head gate | 10 full + 18 windows |
+```bash
+python scripts/prepare_data.py --corpus mix --seq-len 1024 --train-rows 128 --val-rows 20 --output data/pilot-mix
+python -m pipelined_lm.train --recipe pipeline --device cuda --data data/pilot-mix \
+  --steps 2 --global-batch 64 --micro-batch 1 --eval-rows 20 --output runs/pilot-pipeline
+```
 
-Counts above include the input and output layers for the 28-layer model. With 64-cycle windows and an 8,192-token context, the windowed variants use **36.2%** of the full-KV tensor capacity. Runtime workspaces, hidden states and measured HBM traffic are separate quantities.
+For the 16-stage experiment on the same 128 rows, use `--recipe folded-plt4` with the same batch and step arguments and a fresh output directory. For a CPU real-data integration check, use `--size tiny --device cpu` and a small sequence length at data preparation. The tiny real-data model retains the Qwen token vocabulary.
 
-## Matched 5B-token results
+## Research-size training
 
-Five stage-boundary Foresight runs trained from scratch with the same budget of **5,000,003,584 prediction targets**. NLL is evaluated on an independent set of 2,048 rows × 1,024 targets per domain. The downstream column is the unweighted average of zero-shot ARC-Easy, ARC-Challenge and PIQA accuracy. These are single-seed observations.
+| Recipe | Data | Default target | Global batch × sequence length | Learning rate |
+|---|---|---:|---:|---|
+| `plt4` | FineWeb-Edu | 45,777 steps / 6,000,082,944 targets | 128 × 1,024 | 128-update warmup to 3e-4, then constant |
+| `folded-plt4` | Select the same corpus as the intended control | Supply `--steps` | 128 × 1,024 by default | Same schedule as PLT-4 |
+| `pipeline` | 90% FineWeb-Edu + 10% FineMath | 76,294 steps / 5,000,003,584 targets | 64 × 1,024 | 100-update warmup to 3e-4, with the historical cosine extension at update 22,889 |
 
-| KV policy | FineWeb-Edu NLL ↓ | FineMath NLL ↓ | Downstream avg. (%) ↑ |
-|---|---:|---:|---:|
-| Full 2D | 2.8412 | 2.5928 | 47.47 |
-| G-SWA 1D | 2.8791 | 2.6336 | 46.52 |
-| 2D history | 2.8801 | 2.6393 | 47.14 |
-| 2D direct frontier | 2.8609 | 2.6185 | 47.62 |
-| 2D gated frontier | 2.8647 | 2.6229 | 47.50 |
+The trainer uses AdamW with betas (0.9, 0.95), weight decay 0.1 on backbone matrices, zero decay on scalar/vector parameters and the Pipeline cross-stage aggregation, and gradient clipping at 1.0. CUDA uses BF16 autocast and FP32 optimizer parameters. Smaller microbatches increase gradient accumulation while preserving global batch, LR and row order.
 
-At the same bounded KV capacity, direct frontier improved NLL over history by 0.0192 on FineWeb-Edu and 0.0208 on FineMath. Full 2D gave the lowest NLL on both domains. Full 1D has a different historical evaluation record and is omitted from this matched table.
+Choose one recipe. Prepare enough unique training rows for the cumulative budget. The launcher below uses four allocated GPUs on one Linux node; `python -m pipelined_lm.train` runs the same recipe on one GPU. With `torchrun`, global batch must be divisible by world size times microbatch.
 
-## Experimental subblock residuals
+```bash
+# Historical-size Pipeline run. The data files need roughly 20 GB plus preparation/cache space.
+python scripts/prepare_data.py --corpus mix --train-rows 4882816 --val-rows 2048 --output data/pipeline-5b
+torchrun --standalone --nproc-per-node=4 -m pipelined_lm.train \
+  --recipe pipeline --data data/pipeline-5b --steps 76294 --micro-batch 1 --output runs/pipeline-5b
+```
 
-For the earlier aligned-Foresight ablation, set `aligned_foresight=True` with `policy="direct"`. It reads the previous cycle’s matching attention/FFN output at each site, without the extra same-trajectory depth reader.
+```bash
+# Shared-weight PLT-4. Reuse this same prepared directory for a matched folded run.
+python scripts/prepare_data.py --corpus web --train-rows 5859456 --val-rows 2048 --output data/plt-web
+torchrun --standalone --nproc-per-node=4 -m pipelined_lm.train \
+  --recipe plt4 --data data/plt-web --steps 45777 --micro-batch 1 --output runs/plt4-6b
+```
 
-`PipelinedLM(policy="direct", subblock_residuals=True, block_size=4)` enables aligned Foresight before every middle-stage attention and FFN. In the diagram, A4 can also retrieve the completed A1 and A2 endpoints along its own trajectory. Inside a stage, all 12 sublayers have independent depth queries over completed block updates and the live partial update. A block groups four sublayers by default. Setting `block_size=1` exposes each previous sublayer update individually.
+For folded PLT at that budget, change the last command to `--recipe folded-plt4 --steps 45777 --output runs/folded-plt4-6b`. This is a proposed comparison budget. The previously reported quality table covers the untied Pipeline experiments. The portable public data builder starts a new deterministic row ordering. Replaying an archived experiment exactly also requires its original token rows and initial tensors. An original independent-row directory works directly, and `--initial-weights /path/to/initial.pt` accepts a strictly matching raw state dict on the first launch.
 
-The additional write gates start at zero, so the initial function equals the direct-frontier boundary model with the same seed. This variant has CPU checks for the training graph, incremental decode and gradients. The 5B table above reports stage-boundary models.
+## Checkpoints, validation and handoff
 
-## Code and verification
+- Every launch verifies the train/val file sizes and checksums, compares training-path logits with incremental decode on the selected device, and checks finite model state. CPU uses relative L2 tolerance 1e-4 and CUDA BF16 uses 0.02. The unit suite also checks KV, causality, packed-document boundaries, gradients and window rollover.
+- Validation reports mean next-token NLL on the first `--eval-rows` held-out rows (default 128). Set `--eval-rows 2048` for the whole 2,048-row validation split. The trainer validates and saves at the final step and at `--eval-every` / `--save-every` intervals.
+- `latest.pt` is replaced atomically and contains model, AdamW state, per-rank RNG, next data row and cumulative targets. After an interruption, repeat the original command with `--resume`. Keep the same data, model, device type, world size, global batch and microbatch. `--steps` is the cumulative target. Missing training rows produce an error before training starts.
+- To use local text with the same data builder, pass `--web-jsonl` and, for a local mixture, `--math-jsonl`. Each file contains one JSON object with a `text` field per line. `--tokenizer-json` accepts a local copy of the pinned tokenizer. The manifest records source identities, per-split counts, widths and hashes.
+- Report the Git commit, recipe, data manifest hash, GPU model/count, global and microbatch sizes, last step/targets, validation NLL and checkpoint location. The packaged CPU runs have been tested. The CUDA-specific unit check runs on GPU hosts; GPU throughput and quality of the new folded experiment remain to be measured.
 
-- [Model and loss](pipelined_lm/model.py) · [G-SWA training and streaming](pipelined_lm/gswa.py) · [Full-KV training and streaming](pipelined_lm/full_kv.py)
-- [Same-trajectory depth reads](pipelined_lm/depth_read.py) · [Aligned Foresight](pipelined_lm/subblock.py)
-- [Optimized decoder](pipelined_lm/engine.py) · [CUDA kernels](pipelined_lm/kernels) · [Independent trajectory checks](tests/test_pipeline.py)
-
-The CPU suite compares sequence-parallel logits, KV and gradients against scalar token-by-token oracles. It also checks chunked decode, document boundaries, future-token causality and the zero-gate baseline. The optional CUDA decoder uses Triton and a compatible vLLM build exposing the paged FlashAttention backend. This repository packaging was verified on CPU; CUDA Graph parity and throughput need measurement on the target GPU stack.
-
-For the related shared-weight looped architecture and its benchmarks, see [InfuseLoop](https://github.com/thuEcstasy/InfuseLoop).
+[Training entry point](pipelined_lm/train.py) · [Public data builder](scripts/prepare_data.py) · [Shared PLT and folded PLT](pipelined_lm/folded_plt.py) · [Untied Pipeline](pipelined_lm/model.py)

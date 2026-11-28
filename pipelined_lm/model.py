@@ -26,7 +26,35 @@ POLICIES = {
 }
 
 
-class PipelinedLM(nn.Module):
+class AutoregressiveLM(nn.Module):
+    """Tied vocabulary head and packed next-token objective."""
+
+    def head(self, x):
+        return project(
+            self.final_norm(x.float()),
+            getattr(self, "inference_head_weight", self.embedding.weight),
+        )
+
+    def forward(self, tokens, docs=None, *, valid=None):
+        """Return next-token logits [batch, sequence, vocab]."""
+        return self.head(self.hidden(tokens, docs, valid=valid))
+
+    def loss(self, tokens, docs=None, *, valid=None, chunk=512):
+        """Mean next-token NLL. Skip padding and document transitions."""
+        docs = torch.zeros_like(tokens) if docs is None else docs
+        ids, segments, mask = layout(tokens, docs, valid)
+        keep = mask[:, 1:] & mask[:, :-1] & (segments[:, 1:] == segments[:, :-1])
+        if not keep.any():
+            raise ValueError("at least one within-document target is required")
+        h = self.hidden(ids[:, :-1], docs[:, :-1], valid=mask[:, :-1])
+        features = self.final_norm(h[keep].float())
+        return (
+            linear_ce(features, self.embedding.weight, ids[:, 1:][keep], chunk=chunk)
+            / keep.sum()
+        )
+
+
+class PipelinedLM(AutoregressiveLM):
     """Build the Qwen3-0.6B-shaped research model, or pass a smaller Backbone."""
 
     def __init__(
@@ -159,30 +187,6 @@ class PipelinedLM(nn.Module):
 
     def coda_layers(self):
         return tuple(self.stack[i] for i in self.cfg.partition.tail_indices())
-
-    def head(self, x):
-        return project(
-            self.final_norm(x.float()),
-            getattr(self, "inference_head_weight", self.embedding.weight),
-        )
-
-    def forward(self, tokens, docs=None, *, valid=None):
-        """Return next-token logits [batch, sequence, vocab]."""
-        return self.head(self.hidden(tokens, docs, valid=valid))
-
-    def loss(self, tokens, docs=None, *, valid=None, chunk=512):
-        """Mean next-token NLL. Skip padding and document transitions."""
-        docs = torch.zeros_like(tokens) if docs is None else docs
-        ids, segments, mask = layout(tokens, docs, valid)
-        keep = mask[:, 1:] & mask[:, :-1] & (segments[:, 1:] == segments[:, :-1])
-        if not keep.any():
-            raise ValueError("at least one within-document target is required")
-        h = self.hidden(ids[:, :-1], docs[:, :-1], valid=mask[:, :-1])
-        features = self.final_norm(h[keep].float())
-        return (
-            linear_ce(features, self.embedding.weight, ids[:, 1:][keep], chunk=chunk)
-            / keep.sum()
-        )
 
     def cuda_decoder(self, batch_size, capacity):
         """Build a separate inference copy with paged BF16 KV and CUDA Graph support."""

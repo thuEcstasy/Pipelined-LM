@@ -2,7 +2,7 @@
 
 import argparse
 import torch
-from pipelined_lm import Backbone, PipelinedLM
+from pipelined_lm import Backbone, FoldedPLT4, PipelinedLM, PLT4
 
 
 @torch.inference_mode()
@@ -16,7 +16,10 @@ def main():
         parser.error("new-tokens must be positive")
     torch.set_num_threads(min(4, torch.get_num_threads()))
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
-    model = PipelinedLM(Backbone(**ckpt["backbone"]), **ckpt["options"]).eval()
+    model_type = {"pipeline": PipelinedLM, "folded-plt4": FoldedPLT4, "plt4": PLT4}[
+        ckpt.get("architecture", "pipeline")
+    ]
+    model = model_type(Backbone(**ckpt["backbone"]), **ckpt["options"]).eval()
     model.load_state_dict(ckpt["model"])
     prefix = torch.tensor([args.tokens])
     if (prefix < 0).any() or (prefix >= model.c.vocab).any():
