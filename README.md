@@ -81,6 +81,8 @@ For untied Pipeline ablations, choose `--pipeline-policy full_1d|full_2d|gswa_1d
 
 ## Folded PLT-4 with and without Foresight
 
+Before launching either arm on a new machine, run the [folded PLT-4 correctness reference and GPU acceptance command](docs/folded-plt4-correctness.md). It checks both Foresight settings, direct frontier visibility, and the 2D G-SWA attention weights.
+
 Use the same prepared `data/plt-web` directory from the previous section for both jobs. These commands start two independent scratch runs. Each processes 6,000,082,944 targets with the same backbone initialization, row order, optimizer settings and learning-rate schedule. Run each command on its own allocated four-GPU node, or run them successively on one node.
 
 ```bash

@@ -9,62 +9,7 @@ import torch
 from torch.nn import functional as F
 
 from pipelined_lm import FoldedPLT4, tiny_backbone
-
-
-def scalar_trajectory(model, ids):
-    """Single document. Index all states by their final prediction, not the clock."""
-    depth = len(model.stack) // 4
-    banks, states, entries = {}, {}, {}
-    for stage in range(16):
-        for c in range(len(ids)):
-            target = c + 16 - stage
-            e = model.embedding(ids[c : c + 1].view(1, 1))
-            if model.cross_part is not None and stage and c:
-                mix = model.cross_part
-                # Fix the receiving trajectory. Earlier producers at c-1
-                # aim progressively further ahead than its own predecessor.
-                previous = [states[j, target + stage - j - 1] for j in range(stage)]
-                values = torch.stack(
-                    [F.rms_norm(h.float(), (model.c.dim,), eps=mix.eps) for h in previous],
-                    -2,
-                )
-                scores = (values @ mix.query[stage - 1]) / model.c.dim**0.5
-                weights = (scores + mix.bias[stage - 1]).softmax(-1)
-                x = e + mix.alpha[stage - 1] * (weights[..., None] * values).sum(-2)
-            else:
-                x = e + states.get((stage - 1, target), 0)
-            entries[stage, target] = x
-            for ell in range(depth):
-                layer = model.stack[(stage * depth + ell) % len(model.stack)]
-                q, kv, gate = layer.project(x, ids.new_tensor([[c]]))
-                banks[stage, ell, target] = kv
-
-                def retrieve(keys):
-                    k, v = (
-                        torch.cat(parts, 2)
-                        for parts in zip(*(banks[key] for key in keys))
-                    )
-                    groups = model.c.heads // model.c.kv_heads
-                    scores = q @ k.repeat_interleave(groups, 1).transpose(-2, -1)
-                    return (scores / q.size(-1) ** 0.5).softmax(
-                        -1
-                    ) @ v.repeat_interleave(groups, 1)
-
-                out = retrieve([(0, ell, s) for s in range(16, target + stage + 1)])
-                if stage:
-                    keys = []
-                    for producer in range(1, stage + 1):
-                        last = target + stage - producer
-                        first = max(16 - producer, last - 31)
-                        keys.extend((producer, ell, s) for s in range(first, last + 1))
-                    out = (1 - gate) * out + gate * retrieve(keys)
-                u = x + layer.gamma * layer.o(out.transpose(1, 2).flatten(-2))
-                z = layer.n2(u)
-                x = u + layer.gamma * layer.ffn_output_norm(
-                    layer.down(F.silu(layer.mgate(z)) * layer.up(z))
-                )
-            states[stage, target] = x
-    return states, entries, banks
+from tests.folded_reference import readout, scalar_trajectory
 
 
 class FoldedPLTTest(unittest.TestCase):
@@ -77,7 +22,12 @@ class FoldedPLTTest(unittest.TestCase):
             tiny_backbone(), layers=8, window=32, dim=16, intermediate=24
         )
         self.model = FoldedPLT4(self.shape)
-        self.close = lambda a, b: torch.testing.assert_close(a, b, rtol=2e-4, atol=3e-5)
+        self.metrics = {}
+
+    def close(self, observed, reference, label="other"):
+        delta = float((observed.detach() - reference.detach()).abs().max())
+        self.metrics[label] = max(self.metrics.get(label, 0.0), delta)
+        torch.testing.assert_close(observed, reference, rtol=2e-4, atol=3e-5)
 
     def foresight_model(self, *, device="cpu", shape=None):
         model = FoldedPLT4(shape or self.shape, device=device, foresight=True)
@@ -94,7 +44,8 @@ class FoldedPLTTest(unittest.TestCase):
         enabled = FoldedPLT4(self.shape, foresight=True)
         shared = self.model.state_dict()
         self.assertEqual(
-            set(shared), {k for k in enabled.state_dict() if not k.startswith("cross_part.")}
+            set(shared),
+            {k for k in enabled.state_dict() if not k.startswith("cross_part.")},
         )
         for k, p in shared.items():
             self.assertTrue(torch.equal(p, enabled.state_dict()[k]), k)
@@ -114,13 +65,24 @@ class FoldedPLTTest(unittest.TestCase):
             other.load_state_dict(shared, strict=True)
 
     def test_trajectory_frontier_and_full_gradients(self):
-        self.check_trajectory(self.model)
+        self.check_trajectory(self.model, foresight=False)
 
     def test_foresight_trajectory_frontier_and_full_gradients(self):
-        self.check_trajectory(self.foresight_model())
+        self.check_trajectory(self.foresight_model(), foresight=True)
 
-    def check_trajectory(self, m):
+    def check_trajectory(self, m, *, foresight):
+        with torch.no_grad():
+            for layer in m.stack:
+                layer.gate_weight.copy_(
+                    torch.linspace(-0.1, 0.1, layer.gate_weight.numel()).view_as(
+                        layer.gate_weight
+                    )
+                )
+                layer.gate_bias.copy_(
+                    torch.linspace(-0.4, 0.3, layer.gate_bias.numel())
+                )
         oracle = copy.deepcopy(m)
+        weights = dict(oracle.named_parameters())
         for r in range(12):
             for ell in range(2):
                 self.assertIs(m.layer(r, ell), m.layer(r + 4, ell))
@@ -128,21 +90,29 @@ class FoldedPLTTest(unittest.TestCase):
         length = 18 if m.cross_part is not None else 5
         ids = (torch.arange(length)[None] * 13 + 2) % m.c.vocab
         graph = m.hidden(ids, return_details=True)
-        h, entries, banks = scalar_trajectory(oracle, ids[0])
+        h, entries, banks = scalar_trajectory(
+            weights, oracle.c, ids[0], foresight=foresight
+        )
         for r in range(16):
             for c in range(ids.size(1)):
                 p = c + 16 - r
-                self.close(graph.inputs[r][:, c : c + 1], entries[r, p])
-                self.close(graph.loops[r][:, c : c + 1], h[r, p])
+                self.close(graph.inputs[r][:, c : c + 1], entries[r, p], "stage_input")
+                self.close(graph.loops[r][:, c : c + 1], h[r, p], "stage_output")
                 for ell in range(2):
-                    for actual, expected in zip(graph.kv[r, ell], banks[r, ell, p]):
-                        self.close(actual[:, :, c : c + 1], expected)
-        ref = oracle.head(torch.cat([h[15, p] for p in range(1, ids.size(1) + 1)], 1))
-        self.close(m.head(graph.hidden), ref)
+                    for side, actual, expected in zip(
+                        ("K", "V"), graph.kv[r, ell], banks[r, ell, p]
+                    ):
+                        self.close(actual[:, :, c : c + 1], expected, side)
+        ref = readout(
+            weights,
+            oracle.c,
+            torch.cat([h[15, p] for p in range(1, ids.size(1) + 1)], 1),
+        )
+        self.close(m.head(graph.hidden), ref, "logits")
         ref_loss = F.cross_entropy(ref[:, :-1].flatten(0, 1), ids[:, 1:].flatten())
         m.checkpoint_layers = True
         observed = m.loss(ids, chunk=2)
-        self.close(observed, ref_loss)
+        self.close(observed, ref_loss, "nll")
         observed.backward()
         ref_loss.backward()
         for (name, p), (other, q) in zip(
@@ -151,7 +121,7 @@ class FoldedPLTTest(unittest.TestCase):
             self.assertEqual(name, other)
             self.assertIsNotNone(p.grad, name)
             self.assertTrue(p.grad.isfinite().all(), name)
-            self.close(p.grad, q.grad)
+            self.close(p.grad, q.grad, "gradients")
         if m.cross_part is not None:
             self.assertTrue(all(a.grad.abs().sum() > 0 for a in m.cross_part.alpha))
             self.assertGreater(m.cross_part.query[-1].grad.abs().sum().item(), 0)
@@ -216,8 +186,11 @@ class FoldedPLTTest(unittest.TestCase):
         self.assertEqual((m.stages, m.depth, len(m.stack)), (16, 7, 28))
         ids = (torch.arange(36) * 13 % m.c.vocab)[None]
         # Exercise a full-width ring and a frontier up to 15 prediction positions.
-        h, _, _ = scalar_trajectory(m, ids[0])
-        self.close(m(ids)[:, -2:], m.head(torch.cat([h[15, 35], h[15, 36]], 1)))
+        weights = dict(m.named_parameters())
+        h, _, _ = scalar_trajectory(weights, m.c, ids[0], foresight=False)
+        self.close(
+            m(ids)[:, -2:], readout(weights, m.c, torch.cat([h[15, 35], h[15, 36]], 1))
+        )
 
     def test_checkpoint_next_update(self):
         self.check_next_update(self.model)
@@ -238,7 +211,9 @@ class FoldedPLTTest(unittest.TestCase):
 
         step(m, opt, 0)
         file = io.BytesIO()
-        torch.save(dict(model=m.state_dict(), optimizer=opt.state_dict(), row=1), file)
+        torch.save(
+            {"model": m.state_dict(), "optimizer": opt.state_dict(), "row": 1}, file
+        )
         file.seek(0)
         saved = torch.load(file, weights_only=True)
         other = FoldedPLT4(self.shape, seed=11, foresight=m.cross_part is not None)
@@ -253,51 +228,16 @@ class FoldedPLTTest(unittest.TestCase):
             for key in opt.state[p]:
                 self.assertTrue(torch.equal(opt.state[p][key], other_opt.state[q][key]))
 
-    @unittest.skipUnless(
-        torch.cuda.is_available(), "CUDA device required for BF16 backend checks"
-    )
+
+class FoldedCUDATest(unittest.TestCase):
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
     def test_cuda_training_and_streaming(self):
-        shape = replace(self.shape, layers=4, head_dim=32)
+        from tests.folded_backend import check_backend, configure_cuda
+
+        configure_cuda()
         for foresight in (False, True):
             with self.subTest(foresight=foresight):
-                model = (
-                    self.foresight_model(device="cuda", shape=shape)
-                    if foresight else FoldedPLT4(shape, device="cuda")
-                )
-                self.check_cuda(model)
-
-    def check_cuda(self, m):
-        ids = (torch.arange(80, device="cuda").view(2, 40) * 11) % m.c.vocab
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            graph = m.hidden(ids, return_details=True)
-            logits = m.head(graph.hidden)
-            loss = m.loss(ids, chunk=16)
-            continued = m.decode(ids[:, 33:], cache=m.prefill(ids[:, :33]).cache)
-            streamed = m.decode(ids)
-
-        def parity(a, b):
-            self.assertTrue(a.isfinite().all() and b.isfinite().all())
-            self.assertLess(
-                (
-                    (a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-8)
-                ).item(),
-                0.02,
-            )
-
-        parity(streamed.logits, logits)
-        parity(continued.logits, logits[:, 33:])
-        for (r, ell), pair in graph.kv.items():
-            if r == 0:
-                for cached, expected in zip(streamed.cache.global_banks[ell], pair):
-                    parity(cached[:, :, :40], expected)
-            else:
-                slots = torch.arange(8, 40, device="cuda") % 32
-                for ring, expected in zip(streamed.cache.local_banks[ell], pair):
-                    parity(ring[:, :, r - 1].index_select(2, slots), expected[:, :, 8:])
-        loss.backward()
-        self.assertTrue(
-            all(p.grad is not None and p.grad.isfinite().all() for p in m.parameters())
-        )
+                check_backend("cuda", foresight, {})
 
 
 if __name__ == "__main__":
