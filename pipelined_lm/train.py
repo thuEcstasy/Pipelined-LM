@@ -376,6 +376,10 @@ def main():
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA requested but unavailable")
         torch.cuda.set_device(local_rank)
+        # Each frontier-bank count and sequence length specializes the FlexAttention kernel.
+        torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, 128)
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
         if not torch.cuda.is_bf16_supported():
             raise RuntimeError("the research recipes require BF16 support")
     else:
