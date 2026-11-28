@@ -23,12 +23,16 @@ The path for prediction **A** is **A1 → A2 → A3 → A4**. Each stage receive
 
 `FoldedPLT4` starts from the shared 28-layer PLT-4 backbone. Each of its four passes is split into four cross-token stages of seven layers. A single prediction visits physical layers 1–7, 8–14, 15–21 and 22–28, then repeats that path three more times. The final stage feeds the tied LM head. The implementation retains PLT-4's FFN output RMSNorm and residual scale $0.5/(4\sqrt{28})$.
 
-The first stage receives the current token embedding. Every subsequent stage adds that cycle's token embedding to its own trajectory's preceding stage output from one cycle earlier. This version uses the plain predecessor connection with Foresight disabled. At each layer offset 0–6, stage 1 publishes global KV. Stage $r>1$ mixes global attention with one joint local attention over stages 2 through $r$, using the last 32 execution cycles inclusive. All same-offset projections for the current cycle are published before attention. For a receiver predicting position $t$, an earlier producer $j$ can supply states through $t+r-j$, including the direct frontier.
+Follow prediction A through the first four of its 16 stages. With Foresight off (the default), A4 receives the current token embedding plus A3. With Foresight on, A4 adds a learned mixture of A3, B2 and C1 to the current embedding. All three states finished in the previous cycle. At stage 16 the same rule admits 15 sources. Stage 1 and the first cycle of a document use only the current embedding.
+
+Each receiving stage RMS-normalizes each source, scores it with its own learned query and per-source biases, takes a softmax across sources, and scales the weighted sum by a learned scalar. Queries and biases start at zero and scales at one, yielding a uniform mixture of normalized sources at initialization. At width 1,024 the 15 receivers add 15,495 learned parameters. Decode reuses the previous cycle’s 15 hidden states already kept for the predecessor chain.
+
+At each layer offset 0–6, stage 1 publishes global KV. Stage $r>1$ mixes global attention with one joint local attention over stages 2 through $r$, using the last 32 execution cycles inclusive. All same-offset projections for the current cycle are published before attention. For a receiver predicting position $t$, an earlier producer $j$ can supply states through $t+r-j$, including the direct frontier.
 
 This gives 7 global banks and 105 local windows. Training evaluates all token positions together within a stage; decode batches the four uses of each physical slice, then processes all 16 global queries together. A trajectory uses 112 layer evaluations, and the ideal backbone critical path per steady-state token is 7 layers. The corresponding **serial four-pass loop** has a 112-layer critical path, giving a theoretical 16× depth ratio. The existing **pipelined PLT-4** has a 28-layer per-cycle path, giving a 4× ratio against that baseline. Both ratios describe depth. Wall-clock speed and training throughput require hardware measurements.
 
 ```bash
-python examples/train.py --architecture folded-plt4 --checkpoint-layers --steps 2 --output checkpoints/folded-tiny.pt
+python examples/train.py --architecture folded-plt4 --foresight --checkpoint-layers --steps 2 --output checkpoints/folded-tiny.pt
 python examples/decode.py checkpoints/folded-tiny.pt --tokens 11 23 7 --new-tokens 4
 python -m unittest tests.test_folded_plt -v
 ```

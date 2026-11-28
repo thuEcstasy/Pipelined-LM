@@ -44,6 +44,7 @@ def main():
         action="store_true",
         help="recompute folded backbone layers in backward",
     )
+    parser.add_argument("--foresight", action=argparse.BooleanOptionalAction)
     parser.add_argument("--subblock-residuals", action="store_true")
     parser.add_argument("--steps", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=2)
@@ -53,6 +54,8 @@ def main():
         parser.error("steps and batch size must be positive")
     if args.output and args.output.exists():
         parser.error("choose a new output path")
+    if args.architecture == "plt4" and args.foresight is not None:
+        parser.error("the Foresight switch applies to folded-plt4 and pipeline")
     if args.device == "cpu":
         torch.set_num_threads(min(4, torch.get_num_threads()))
     shape = tiny_backbone() if args.size == "tiny" else Backbone()
@@ -82,17 +85,19 @@ def main():
         )
     if args.architecture in ("plt4", "folded-plt4"):
         kwargs = dict(checkpoint_layers=args.checkpoint_layers)
+        if args.architecture == "folded-plt4":
+            kwargs["foresight"] = bool(args.foresight)
         model_type = FoldedPLT4 if args.architecture == "folded-plt4" else PLT4
         model = model_type(shape, device=args.device, **kwargs)
     else:
         kwargs = dict(policy=args.policy, subblock_residuals=args.subblock_residuals)
+        kwargs["foresight"] = args.foresight is not False
         model = PipelinedLM(shape, device=args.device, **kwargs)
     if args.initial_weights:
-        model.load_state_dict(
+        model.load_initial_weights(
             torch.load(
                 args.initial_weights, map_location="cpu", weights_only=True, mmap=True
-            ),
-            strict=True,
+            )
         )
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95))
     count = 0

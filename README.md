@@ -5,7 +5,7 @@ Train autoregressive models that overlap work for successive predictions. All th
 | Recipe | One prediction trajectory | Attention and hidden-state inputs |
 |---|---|---|
 | `plt4` | Four passes through one shared 28-layer stack | The first pass supplies global KV; each later pass reads its own 64-cycle window. Each pass takes the current embedding and its own trajectory's previous pass output. |
-| `folded-plt4` | Each of the four shared passes splits into four 7-layer stages, for 16 stages total | Direct 2D G-SWA with 7 global banks and 105 windows of 32 cycles. Earlier stages publish the legal same-cycle frontier. Every stage receives the current embedding. Foresight is off. |
+| `folded-plt4` | Each of the four shared passes splits into four 7-layer stages, for 16 stages total | Direct 2D G-SWA with 7 global banks and 105 windows of 32 cycles. Earlier stages publish the legal same-cycle frontier. Every stage receives the current embedding. Stage-boundary Foresight can be switched on or off (default off). |
 | `pipeline` | 2 input layers, four independent 6-layer stages, 2 output layers | Foresight at each stage boundary, direct 2D G-SWA with a shared first-stage global bank per layer offset and 64-cycle local windows. |
 
 [Architecture, other cache policies, and previous experimental results](docs/architecture.md)
@@ -57,7 +57,7 @@ For the 16-stage experiment on the same 128 rows, use `--recipe folded-plt4` wit
 | `folded-plt4` | Select the same corpus as the intended control | Supply `--steps` | 128 × 1,024 by default | Same schedule as PLT-4 |
 | `pipeline` | 90% FineWeb-Edu + 10% FineMath | 76,294 steps / 5,000,003,584 targets | 64 × 1,024 | 100-update warmup to 3e-4, with the historical cosine extension at update 22,889 |
 
-The trainer uses AdamW with betas (0.9, 0.95), weight decay 0.1 on backbone matrices, zero decay on scalar/vector parameters and the Pipeline cross-stage aggregation, and gradient clipping at 1.0. CUDA uses BF16 autocast and FP32 optimizer parameters. Smaller microbatches increase gradient accumulation while preserving global batch, LR and row order.
+The trainer uses AdamW with betas (0.9, 0.95), weight decay 0.1 on backbone matrices, zero decay on scalar/vector parameters and the cross-stage aggregation parameters, and gradient clipping at 1.0. CUDA uses BF16 autocast and FP32 optimizer parameters. Smaller microbatches increase gradient accumulation while preserving global batch, LR and row order.
 
 Choose one recipe. Prepare enough unique training rows for the cumulative budget. The launcher below uses four allocated GPUs on one Linux node; `python -m pipelined_lm.train` runs the same recipe on one GPU. With `torchrun`, global batch must be divisible by world size times microbatch.
 
@@ -75,9 +75,38 @@ torchrun --standalone --nproc-per-node=4 -m pipelined_lm.train \
   --recipe plt4 --data data/plt-web --steps 45777 --micro-batch 1 --output runs/plt4-6b
 ```
 
-For folded PLT at that budget, change the last command to `--recipe folded-plt4 --steps 45777 --output runs/folded-plt4-6b`. This is a proposed comparison budget. The previously reported quality table covers the untied Pipeline experiments. The portable public data builder starts a new deterministic row ordering. Replaying an archived experiment exactly also requires its original token rows and initial tensors. An original independent-row directory works directly, and `--initial-weights /path/to/initial.pt` accepts a strictly matching raw state dict on the first launch.
+The previously reported quality table covers the untied Pipeline experiments. The portable public data builder starts a new deterministic row ordering. Replaying an archived experiment exactly also requires its original token rows and initial tensors. An original independent-row directory works directly, and `--initial-weights /path/to/initial.pt` accepts a strictly matching raw state dict on the first launch.
 
 For untied Pipeline ablations, choose `--pipeline-policy full_1d|full_2d|gswa_1d|history|direct|gated` (one value). Add `--no-foresight` for the same-trajectory-only hidden connection. The direct policy also accepts `--aligned-foresight` or `--subblock-residuals`. The checkpoint stores these choices; repeat them when resuming.
+
+## Folded PLT-4 with and without Foresight
+
+Use the same prepared `data/plt-web` directory from the previous section for both jobs. These commands start two independent scratch runs. Each processes 6,000,082,944 targets with the same backbone initialization, row order, optimizer settings and learning-rate schedule. Run each command on its own allocated four-GPU node, or run them successively on one node.
+
+```bash
+torchrun --standalone --nproc-per-node=4 -m pipelined_lm.train \
+  --recipe folded-plt4 --no-foresight --data data/plt-web --steps 45777 \
+  --global-batch 128 --micro-batch 1 --output runs/folded-plt4-6b-off
+```
+
+```bash
+torchrun --standalone --nproc-per-node=4 -m pipelined_lm.train \
+  --recipe folded-plt4 --foresight --data data/plt-web --steps 45777 \
+  --global-batch 128 --micro-batch 1 --output runs/folded-plt4-6b-on
+```
+
+With Foresight off, stage 16 takes the current embedding plus its trajectory's raw stage-15 output. With Foresight on, stage 16 adds a learned mixture of the **previous cycle's** stage 1–15 outputs to that embedding. Stage 15 supplies the same-trajectory predecessor in this mixture. The rule applies at all 15 stage boundaries. Both jobs use direct frontier KV, seven global banks and 105 local windows of 32 cycles.
+
+For a quick CPU check of both arms, use the same training entry point:
+
+```bash
+for flag in --no-foresight --foresight; do
+  python -m pipelined_lm.train --smoke --recipe folded-plt4 "$flag" \
+    --steps 2 --output "runs/smoke/folded-plt4-${flag#--}" || exit 1
+done
+```
+
+To resume either arm, repeat its command with `--resume`. Folded checkpoints predating the switch resume with `--no-foresight`. Both arms can start from the same bare PLT-4 backbone via `--initial-weights`. The enabled arm initializes its new receiver parameters when the file contains only the backbone. Decode reads the setting from the checkpoint.
 
 ## Checkpoints, validation and handoff
 

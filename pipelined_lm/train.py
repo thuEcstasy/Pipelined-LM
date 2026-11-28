@@ -89,9 +89,9 @@ def args_from_cli():
         help="untied Pipeline cache policy (default: direct)",
     )
     p.add_argument(
-        "--no-foresight",
-        action="store_true",
-        help="untied Pipeline with only the same-trajectory predecessor",
+        "--foresight",
+        action=argparse.BooleanOptionalAction,
+        help="stage-boundary Foresight (default on for pipeline, off for folded-plt4)",
     )
     residual = p.add_mutually_exclusive_group()
     residual.add_argument("--aligned-foresight", action="store_true")
@@ -136,15 +136,16 @@ def args_from_cli():
     a = p.parse_args()
     if a.recipe != "pipeline" and (
         a.pipeline_policy
-        or a.no_foresight
         or a.aligned_foresight
         or a.subblock_residuals
     ):
         p.error(
-            "Pipeline policy and Foresight switches apply only to --recipe pipeline"
+            "Pipeline policy and subblock switches apply only to --recipe pipeline"
         )
+    if a.recipe == "plt4" and a.foresight is not None:
+        p.error("the Foresight switch applies to folded-plt4 and pipeline")
     if (a.aligned_foresight or a.subblock_residuals) and (
-        a.no_foresight or a.pipeline_policy not in (None, "direct")
+        a.foresight is False or a.pipeline_policy not in (None, "direct")
     ):
         p.error("subblock variants require direct frontier and Foresight")
     if a.resume and a.initial_weights:
@@ -182,10 +183,12 @@ def run(a, rank, world, device):
         )
     shape = tiny_backbone() if a.size == "tiny" else Backbone()
     options = (
-        {"policy": a.pipeline_policy or "direct", "foresight": not a.no_foresight}
+        {"policy": a.pipeline_policy or "direct", "foresight": a.foresight is not False}
         if a.recipe == "pipeline"
         else {"checkpoint_layers": True}
     )
+    if a.recipe == "folded-plt4":
+        options["foresight"] = bool(a.foresight)
     if a.aligned_foresight:
         options["aligned_foresight"] = True
     if a.subblock_residuals:
@@ -233,6 +236,9 @@ def run(a, rank, world, device):
     start = 0
     if a.resume:
         saved = torch.load(out, map_location="cpu", weights_only=True, mmap=True)
+        if saved["run"]["recipe"] == "folded-plt4":
+            # Folded checkpoints written before the switch used the raw predecessor.
+            saved["run"]["options"].setdefault("foresight", False)
         if (
             saved["run"] != run_id
             or saved["targets"] != saved["step"] * run_id["targets_per_update"]
@@ -245,11 +251,10 @@ def run(a, rank, world, device):
             raise ValueError("checkpoint row cursor or target step mismatch")
         model.load_state_dict(saved["model"], strict=True)
     elif a.initial_weights:
-        model.load_state_dict(
+        model.load_initial_weights(
             torch.load(
                 a.initial_weights, weights_only=True, map_location="cpu", mmap=True
-            ),
-            strict=True,
+            )
         )
     opt = optimizer_for(model, cuda)
     if a.resume:
@@ -289,6 +294,7 @@ def run(a, rank, world, device):
         log(
             "ready",
             recipe=a.recipe,
+            foresight=options.get("foresight", False),
             next_row=start * a.global_batch,
             step=start,
             world=world,

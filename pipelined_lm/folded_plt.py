@@ -9,6 +9,7 @@ from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
 from .config import Backbone
+from .core.aggregation import CrossLoopAggregation
 from .core.layers import Layer, positions, shift
 from .core.precision import enable
 from .core.sequence import GraphOutput, layout
@@ -73,6 +74,7 @@ class _LoopedPipeline(AutoregressiveLM):
         self, backbone=None, *, seed=20261017, device="cpu", checkpoint_layers=False
     ):
         super().__init__()
+        self.cross_part = None
         self.c = c = backbone or Backbone(window=self.window)
         self.stages = self.outer_loops * self.folds
         if (
@@ -149,7 +151,19 @@ class _LoopedPipeline(AutoregressiveLM):
         banks = {}
         inputs, outputs = [], []
         for stage in range(self.stages):
-            x = e if stage == 0 else e + shift(x, segments)
+            if stage == 0:
+                x = e
+            elif self.cross_part is None:
+                x = e + shift(x, segments)
+            else:
+                # Freeze this prefix of producers for backward recomputation.
+                args = (e, tuple(outputs), segments, valid)
+                if self.checkpoint_layers and self.training and torch.is_grad_enabled():
+                    x = checkpoint(
+                        self.cross_part.training_input, *args, use_reentrant=False
+                    )
+                else:
+                    x = self.cross_part.training_input(*args)
             if return_details:
                 inputs.append(x)
             for ell in range(self.depth):
@@ -164,7 +178,7 @@ class _LoopedPipeline(AutoregressiveLM):
                 else:
                     x, kv = self._training_layer(*args)
                 banks[stage, ell] = kv
-            if return_details:
+            if return_details or self.cross_part is not None:
                 outputs.append(x)
         if return_details:
             return GraphOutput(x, tuple(outputs), tuple(inputs), banks)
@@ -180,8 +194,18 @@ class _LoopedPipeline(AutoregressiveLM):
         else:
             same = valid & cache.last_valid & (docs == cache.last_docs)
             starts = torch.where(same, cache.starts, time)
-            incoming = e + cache.previous * same[None, :, None, None]
-            current = torch.cat((e.unsqueeze(0), incoming), 0)
+            if self.cross_part is None:
+                incoming = e + cache.previous * same[None, :, None, None]
+                current = torch.cat((e.unsqueeze(0), incoming), 0)
+            else:
+                sources = cache.previous.movedim(0, -2)
+                inputs = [e]
+                for r in range(2, self.stages + 1):
+                    message, _ = self.cross_part.message(
+                        sources[..., : r - 1, :], r, history_valid=same[:, None]
+                    )
+                    inputs.append((e.float() + message).to(e.dtype))
+                current = torch.stack(inputs)
         pos = (time - starts)[:, None].repeat(self.outer_loops, 1)
 
         # In one cycle all queries have the same real-token prefix. On the local
@@ -322,6 +346,37 @@ class FoldedPLT4(_LoopedPipeline):
     folds = 4
     window = 32
     cross_stage_local = True
+
+    def __init__(
+        self,
+        backbone=None,
+        *,
+        foresight=False,
+        seed=20261017,
+        device="cpu",
+        checkpoint_layers=False,
+    ):
+        super().__init__(
+            backbone, seed=seed, device=device, checkpoint_layers=checkpoint_layers
+        )
+        if foresight:
+            # Both arms have already drawn identical backbone weights.
+            with torch.device(device):
+                self.cross_part = CrossLoopAggregation(
+                    self.c.dim, self.stages, "attnres", self.c.eps
+                )
+
+    def load_initial_weights(self, weights):
+        if self.cross_part is not None and not any(
+            key.startswith("cross_part.") for key in weights
+        ):
+            # A bare original backbone supplies all shared tensors. Keep the fresh
+            # receiver parameters only when the file contains no Foresight weights.
+            receiver_weights = {
+                "cross_part." + k: v for k, v in self.cross_part.state_dict().items()
+            }
+            weights = {**receiver_weights, **weights}
+        super().load_initial_weights(weights)
 
 
 class PLT4(_LoopedPipeline):

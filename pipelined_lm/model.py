@@ -29,6 +29,9 @@ POLICIES = {
 class AutoregressiveLM(nn.Module):
     """Tied vocabulary head and packed next-token objective."""
 
+    def load_initial_weights(self, weights):
+        self.load_state_dict(weights, strict=True)
+
     def head(self, x):
         return project(
             self.final_norm(x.float()),

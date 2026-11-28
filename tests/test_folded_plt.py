@@ -19,7 +19,20 @@ def scalar_trajectory(model, ids):
         for c in range(len(ids)):
             target = c + 16 - stage
             e = model.embedding(ids[c : c + 1].view(1, 1))
-            x = e + states.get((stage - 1, target), 0)
+            if model.cross_part is not None and stage and c:
+                mix = model.cross_part
+                # Fix the receiving trajectory. Earlier producers at c-1
+                # aim progressively further ahead than its own predecessor.
+                previous = [states[j, target + stage - j - 1] for j in range(stage)]
+                values = torch.stack(
+                    [F.rms_norm(h.float(), (model.c.dim,), eps=mix.eps) for h in previous],
+                    -2,
+                )
+                scores = (values @ mix.query[stage - 1]) / model.c.dim**0.5
+                weights = (scores + mix.bias[stage - 1]).softmax(-1)
+                x = e + mix.alpha[stage - 1] * (weights[..., None] * values).sum(-2)
+            else:
+                x = e + states.get((stage - 1, target), 0)
             entries[stage, target] = x
             for ell in range(depth):
                 layer = model.stack[(stage * depth + ell) % len(model.stack)]
@@ -66,14 +79,54 @@ class FoldedPLTTest(unittest.TestCase):
         self.model = FoldedPLT4(self.shape)
         self.close = lambda a, b: torch.testing.assert_close(a, b, rtol=2e-4, atol=3e-5)
 
+    def foresight_model(self, *, device="cpu", shape=None):
+        model = FoldedPLT4(shape or self.shape, device=device, foresight=True)
+        # Nonuniform, receiver-dependent weights exercise more than the initial mean.
+        with torch.no_grad():
+            mix = model.cross_part
+            for i, (q, b, a) in enumerate(zip(mix.query, mix.bias, mix.alpha)):
+                q.copy_(torch.linspace(-0.6, 0.3, q.numel(), device=device))
+                b.copy_(torch.linspace(0.4, -0.7, b.numel(), device=device))
+                a.fill_(0.6 + i / 20)
+        return model
+
+    def test_foresight_initialization_and_legacy_weights(self):
+        enabled = FoldedPLT4(self.shape, foresight=True)
+        shared = self.model.state_dict()
+        self.assertEqual(
+            set(shared), {k for k in enabled.state_dict() if not k.startswith("cross_part.")}
+        )
+        for k, p in shared.items():
+            self.assertTrue(torch.equal(p, enabled.state_dict()[k]), k)
+        mix = enabled.cross_part
+        for q, b, a in zip(mix.query, mix.bias, mix.alpha):
+            self.assertTrue(torch.all(q == 0) and torch.all(b == 0) and a.item() == 1)
+        other = FoldedPLT4(self.shape, seed=11, foresight=True)
+        other.load_initial_weights(shared)
+        for k, p in enabled.state_dict().items():
+            self.assertTrue(torch.equal(p, other.state_dict()[k]), k)
+        for missing in ("cross_part.alpha.0", "embedding.weight"):
+            weights = dict(enabled.state_dict())
+            del weights[missing]
+            with self.assertRaises(RuntimeError):
+                other.load_initial_weights(weights)
+        with self.assertRaises(RuntimeError):
+            other.load_state_dict(shared, strict=True)
+
     def test_trajectory_frontier_and_full_gradients(self):
-        m = self.model
+        self.check_trajectory(self.model)
+
+    def test_foresight_trajectory_frontier_and_full_gradients(self):
+        self.check_trajectory(self.foresight_model())
+
+    def check_trajectory(self, m):
         oracle = copy.deepcopy(m)
         for r in range(12):
             for ell in range(2):
                 self.assertIs(m.layer(r, ell), m.layer(r + 4, ell))
         self.assertIsNot(m.layer(0, 0), m.layer(1, 0))
-        ids = torch.tensor([[2, 8, 5, 10, 1]])
+        length = 18 if m.cross_part is not None else 5
+        ids = (torch.arange(length)[None] * 13 + 2) % m.c.vocab
         graph = m.hidden(ids, return_details=True)
         h, entries, banks = scalar_trajectory(oracle, ids[0])
         for r in range(16):
@@ -84,7 +137,7 @@ class FoldedPLTTest(unittest.TestCase):
                 for ell in range(2):
                     for actual, expected in zip(graph.kv[r, ell], banks[r, ell, p]):
                         self.close(actual[:, :, c : c + 1], expected)
-        ref = oracle.head(torch.cat([h[15, p] for p in range(1, 6)], 1))
+        ref = oracle.head(torch.cat([h[15, p] for p in range(1, ids.size(1) + 1)], 1))
         self.close(m.head(graph.hidden), ref)
         ref_loss = F.cross_entropy(ref[:, :-1].flatten(0, 1), ids[:, 1:].flatten())
         m.checkpoint_layers = True
@@ -99,10 +152,18 @@ class FoldedPLTTest(unittest.TestCase):
             self.assertIsNotNone(p.grad, name)
             self.assertTrue(p.grad.isfinite().all(), name)
             self.close(p.grad, q.grad)
+        if m.cross_part is not None:
+            self.assertTrue(all(a.grad.abs().sum() > 0 for a in m.cross_part.alpha))
+            self.assertGreater(m.cross_part.query[-1].grad.abs().sum().item(), 0)
+
+    def test_wrap_chunking_packing_and_prefix(self):
+        self.check_wrap(self.model)
+
+    def test_foresight_wrap_chunking_packing_and_prefix(self):
+        self.check_wrap(self.foresight_model())
 
     @torch.no_grad()
-    def test_wrap_chunking_packing_and_prefix(self):
-        m = self.model
+    def check_wrap(self, m):
         ids = (torch.arange(2 * 68).view(2, 68) * 7) % m.c.vocab
         docs = torch.zeros_like(ids)
         docs[1, 20:37] = 1  # recurrent external ID denotes a new document
@@ -159,8 +220,13 @@ class FoldedPLTTest(unittest.TestCase):
         self.close(m(ids)[:, -2:], m.head(torch.cat([h[15, 35], h[15, 36]], 1)))
 
     def test_checkpoint_next_update(self):
+        self.check_next_update(self.model)
+
+    def test_foresight_checkpoint_next_update(self):
+        self.check_next_update(self.foresight_model())
+
+    def check_next_update(self, m):
         ids = torch.tensor([[11, 4, 8, 14, 2], [6, 7, 1, 9, 3]])
-        m = self.model
         opt = torch.optim.AdamW(m.parameters(), lr=3e-4)
 
         def step(model, optim, row):
@@ -175,7 +241,7 @@ class FoldedPLTTest(unittest.TestCase):
         torch.save(dict(model=m.state_dict(), optimizer=opt.state_dict(), row=1), file)
         file.seek(0)
         saved = torch.load(file, weights_only=True)
-        other = FoldedPLT4(self.shape, seed=11)
+        other = FoldedPLT4(self.shape, seed=11, foresight=m.cross_part is not None)
         other.load_state_dict(saved["model"], strict=True)
         other_opt = torch.optim.AdamW(other.parameters(), lr=3e-4)
         other_opt.load_state_dict(saved["optimizer"])
@@ -191,7 +257,16 @@ class FoldedPLTTest(unittest.TestCase):
         torch.cuda.is_available(), "CUDA device required for BF16 backend checks"
     )
     def test_cuda_training_and_streaming(self):
-        m = FoldedPLT4(replace(self.shape, layers=4, head_dim=32), device="cuda")
+        shape = replace(self.shape, layers=4, head_dim=32)
+        for foresight in (False, True):
+            with self.subTest(foresight=foresight):
+                model = (
+                    self.foresight_model(device="cuda", shape=shape)
+                    if foresight else FoldedPLT4(shape, device="cuda")
+                )
+                self.check_cuda(model)
+
+    def check_cuda(self, m):
         ids = (torch.arange(80, device="cuda").view(2, 40) * 11) % m.c.vocab
         with torch.autocast("cuda", dtype=torch.bfloat16):
             graph = m.hidden(ids, return_details=True)
