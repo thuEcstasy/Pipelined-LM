@@ -15,7 +15,7 @@ import torch.distributed as dist
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 
-from . import Backbone, FoldedPLT4, PLT4, PipelinedLM, tiny_backbone
+from . import Backbone, FoldedPLT4, PLT4, POLICIES, PipelinedLM, tiny_backbone
 from .data import open_rows, sha256
 
 MODELS = {"plt4": PLT4, "folded-plt4": FoldedPLT4, "pipeline": PipelinedLM}
@@ -83,6 +83,19 @@ def log(event, **fields):
 def args_from_cli():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--recipe", choices=MODELS, required=True)
+    p.add_argument(
+        "--pipeline-policy",
+        choices=POLICIES,
+        help="untied Pipeline cache policy (default: direct)",
+    )
+    p.add_argument(
+        "--no-foresight",
+        action="store_true",
+        help="untied Pipeline with only the same-trajectory predecessor",
+    )
+    residual = p.add_mutually_exclusive_group()
+    residual.add_argument("--aligned-foresight", action="store_true")
+    residual.add_argument("--subblock-residuals", action="store_true")
     p.add_argument("--output", type=Path, required=True)
     data = p.add_mutually_exclusive_group(required=True)
     data.add_argument(
@@ -121,6 +134,19 @@ def args_from_cli():
         "--initial-weights", type=Path, help="optional original backbone state_dict"
     )
     a = p.parse_args()
+    if a.recipe != "pipeline" and (
+        a.pipeline_policy
+        or a.no_foresight
+        or a.aligned_foresight
+        or a.subblock_residuals
+    ):
+        p.error(
+            "Pipeline policy and Foresight switches apply only to --recipe pipeline"
+        )
+    if (a.aligned_foresight or a.subblock_residuals) and (
+        a.no_foresight or a.pipeline_policy not in (None, "direct")
+    ):
+        p.error("subblock variants require direct frontier and Foresight")
     if a.resume and a.initial_weights:
         p.error("resume reads initialization from latest.pt")
     if a.smoke and a.size == "qwen06":
@@ -156,10 +182,14 @@ def run(a, rank, world, device):
         )
     shape = tiny_backbone() if a.size == "tiny" else Backbone()
     options = (
-        {"policy": "direct", "foresight": True}
+        {"policy": a.pipeline_policy or "direct", "foresight": not a.no_foresight}
         if a.recipe == "pipeline"
         else {"checkpoint_layers": True}
     )
+    if a.aligned_foresight:
+        options["aligned_foresight"] = True
+    if a.subblock_residuals:
+        options["subblock_residuals"] = True
     shape = replace(
         shape,
         window={"plt4": 64, "folded-plt4": 32, "pipeline": shape.window}[a.recipe],
@@ -377,7 +407,9 @@ def main():
             raise RuntimeError("CUDA requested but unavailable")
         torch.cuda.set_device(local_rank)
         # Each frontier-bank count and sequence length specializes the FlexAttention kernel.
-        torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, 128)
+        torch._dynamo.config.recompile_limit = max(
+            torch._dynamo.config.recompile_limit, 128
+        )
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
         if not torch.cuda.is_bf16_supported():

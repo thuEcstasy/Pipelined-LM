@@ -77,6 +77,8 @@ torchrun --standalone --nproc-per-node=4 -m pipelined_lm.train \
 
 For folded PLT at that budget, change the last command to `--recipe folded-plt4 --steps 45777 --output runs/folded-plt4-6b`. This is a proposed comparison budget. The previously reported quality table covers the untied Pipeline experiments. The portable public data builder starts a new deterministic row ordering. Replaying an archived experiment exactly also requires its original token rows and initial tensors. An original independent-row directory works directly, and `--initial-weights /path/to/initial.pt` accepts a strictly matching raw state dict on the first launch.
 
+For untied Pipeline ablations, choose `--pipeline-policy full_1d|full_2d|gswa_1d|history|direct|gated` (one value). Add `--no-foresight` for the same-trajectory-only hidden connection. The direct policy also accepts `--aligned-foresight` or `--subblock-residuals`. The checkpoint stores these choices; repeat them when resuming.
+
 ## Checkpoints, validation and handoff
 
 - Every launch verifies the train/val file sizes and checksums, compares training-path logits with incremental decode on the selected device, and checks finite model state. CPU uses relative L2 tolerance 1e-4 and CUDA BF16 uses 0.02. The unit suite also checks KV, causality, packed-document boundaries, gradients and window rollover.
